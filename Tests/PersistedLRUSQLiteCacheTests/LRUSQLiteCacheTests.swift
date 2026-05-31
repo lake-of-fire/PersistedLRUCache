@@ -76,6 +76,51 @@ final class LRUSQLiteCacheTests: XCTestCase {
         XCTAssertEqual(reloaded.value(forKey: "b"), "B")
     }
 
+    func testSetValuesPersistsBatchAcrossInstances() throws {
+        let root = try makeTemporaryRoot()
+        let namespace = makeNamespace()
+        let cache = LRUSQLiteCache<String, String>(namespace: namespace, cacheRootURL: root)
+
+        cache.setValues([
+            (key: "a", value: "A"),
+            (key: "b", value: "B"),
+            (key: "nil", value: nil),
+        ])
+
+        XCTAssertEqual(cache.value(forKey: "a"), "A")
+        XCTAssertEqual(cache.value(forKey: "b"), "B")
+        XCTAssertNil(cache.value(forKey: "nil"))
+        XCTAssertTrue(cache.containsKey("nil"))
+
+        let reloaded = LRUSQLiteCache<String, String>(namespace: namespace, cacheRootURL: root)
+        XCTAssertEqual(reloaded.value(forKey: "a"), "A")
+        XCTAssertEqual(reloaded.value(forKey: "b"), "B")
+        XCTAssertNil(reloaded.value(forKey: "nil"))
+        XCTAssertTrue(reloaded.containsKey("nil"))
+    }
+
+    func testSetValuesHonorsPersistentCountLimit() throws {
+        let root = try makeTemporaryRoot()
+        let namespace = makeNamespace()
+        let cache = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 2,
+            cacheRootURL: root
+        )
+
+        cache.setValues([
+            (key: "k1", value: "1"),
+            (key: "k2", value: "2"),
+            (key: "k3", value: "3"),
+        ])
+
+        XCTAssertNil(cache.value(forKey: "k1"))
+        XCTAssertFalse(cache.containsKey("k1"))
+        XCTAssertEqual(cache.value(forKey: "k2"), "2")
+        XCTAssertEqual(cache.value(forKey: "k3"), "3")
+    }
+
     func testPersistentCountLimitEvictsOldestRow() throws {
         let root = try makeTemporaryRoot()
         let namespace = makeNamespace()
@@ -100,6 +145,46 @@ final class LRUSQLiteCacheTests: XCTestCase {
         XCTAssertFalse(reloaded.containsKey("k1"))
         XCTAssertEqual(reloaded.value(forKey: "k2"), "2")
         XCTAssertEqual(reloaded.value(forKey: "k3"), "3")
+    }
+
+    func testSetValueDoesNotKeepMemoryValueWhenInsertedRowIsTrimmed() throws {
+        let root = try makeTemporaryRoot()
+        let namespace = makeNamespace()
+        let cache = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 0,
+            memoryCountLimit: .max,
+            cacheRootURL: root
+        )
+
+        cache.setValue("A", forKey: "a")
+
+        XCTAssertNil(cache.value(forKey: "a"))
+        XCTAssertFalse(cache.containsKey("a"))
+    }
+
+    func testSetValuesDoesNotKeepMemoryValuesWhenRowsAreTrimmed() throws {
+        let root = try makeTemporaryRoot()
+        let namespace = makeNamespace()
+        let cache = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 2,
+            memoryCountLimit: .max,
+            cacheRootURL: root
+        )
+
+        cache.setValues([
+            (key: "k1", value: "1"),
+            (key: "k2", value: "2"),
+            (key: "k3", value: "3"),
+        ])
+
+        XCTAssertNil(cache.value(forKey: "k1"))
+        XCTAssertFalse(cache.containsKey("k1"))
+        XCTAssertEqual(cache.value(forKey: "k2"), "2")
+        XCTAssertEqual(cache.value(forKey: "k3"), "3")
     }
 
     func testReadUpdatesPersistentLRUOrderBeforeTrim() throws {

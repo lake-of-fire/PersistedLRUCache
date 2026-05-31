@@ -25,6 +25,12 @@ cache.setValue(data, forKey: "article-1")
 let data = cache.value(forKey: "article-1")
 ```
 
+For bulk cache hydration, use `setValues(_:)` to persist a batch in one SQLite transaction:
+
+```swift
+cache.setValues(articles.map { (key: $0.id, value: $0.data) })
+```
+
 Use `memoryTotalBytesLimit` and `memoryCountLimit` when the persisted LRU limits should be larger than the in-memory front cache.
 
 ## Development

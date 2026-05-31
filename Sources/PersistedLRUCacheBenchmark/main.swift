@@ -37,6 +37,8 @@ enum PersistedLRUCacheBenchmark {
         }
 
         benchmarkSQLite(root: root, payloads: smallPayloads, label: "sqlite small", compressionThreshold: 200_000)
+        benchmarkSQLiteBatchWrites(root: root, payloads: smallPayloads, label: "sqlite small batched", compressionThreshold: 200_000)
+        benchmarkSQLiteLimitedWrites(root: root, payloads: smallPayloads, label: "sqlite count-limited", compressionThreshold: 200_000)
         benchmarkSQLite(root: root, payloads: largePayloads, label: "sqlite large compressed", compressionThreshold: 20_000)
         benchmarkFile(root: root, payloads: Array(smallPayloads.prefix(500)), label: "file small", compressionThreshold: 200_000)
     }
@@ -83,6 +85,63 @@ enum PersistedLRUCacheBenchmark {
             for payload in payloads {
                 _ = reloaded.value(forKey: payload.id)
             }
+        }
+    }
+
+    private static func benchmarkSQLiteBatchWrites(
+        root: URL,
+        payloads: [Payload],
+        label: String,
+        compressionThreshold: Int
+    ) {
+        let namespace = "bench.sqlite.batch.\(UUID().uuidString)"
+        let cache = LRUSQLiteCache<Int, Payload>(
+            namespace: namespace,
+            countLimit: .max,
+            memoryCountLimit: payloads.count,
+            compressionThreshold: compressionThreshold,
+            cacheRootURL: root
+        )
+
+        measure("\(label) writes", operations: payloads.count) {
+            cache.setValues(payloads.map { (key: $0.id, value: $0) })
+        }
+    }
+
+    private static func benchmarkSQLiteLimitedWrites(
+        root: URL,
+        payloads: [Payload],
+        label: String,
+        compressionThreshold: Int
+    ) {
+        let namespace = "bench.sqlite.limited.\(UUID().uuidString)"
+        let countLimit = payloads.count / 2
+        let cache = LRUSQLiteCache<Int, Payload>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: countLimit,
+            memoryCountLimit: countLimit,
+            compressionThreshold: compressionThreshold,
+            cacheRootURL: root
+        )
+
+        measure("\(label) writes", operations: payloads.count) {
+            for payload in payloads {
+                cache.setValue(payload, forKey: payload.id)
+            }
+        }
+
+        let batchCache = LRUSQLiteCache<Int, Payload>(
+            namespace: namespace + ".batch",
+            totalBytesLimit: .max,
+            countLimit: countLimit,
+            memoryCountLimit: countLimit,
+            compressionThreshold: compressionThreshold,
+            cacheRootURL: root
+        )
+
+        measure("\(label) batched writes", operations: payloads.count) {
+            batchCache.setValues(payloads.map { (key: $0.id, value: $0) })
         }
     }
 
