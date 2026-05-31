@@ -33,3 +33,7 @@ Use `memoryTotalBytesLimit` and `memoryCountLimit` when the persisted LRU limits
 swift test
 swift run -c release PersistedLRUCacheBenchmark
 ```
+
+## License
+
+MIT.
