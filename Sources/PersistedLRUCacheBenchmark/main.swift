@@ -38,7 +38,7 @@ enum PersistedLRUCacheBenchmark {
 
         benchmarkSQLite(root: root, payloads: smallPayloads, label: "sqlite small", compressionThreshold: 200_000)
         benchmarkSQLite(root: root, payloads: largePayloads, label: "sqlite large compressed", compressionThreshold: 20_000)
-        benchmarkFile(root: root, payloads: smallPayloads, label: "file small", compressionThreshold: 200_000)
+        benchmarkFile(root: root, payloads: Array(smallPayloads.prefix(500)), label: "file small", compressionThreshold: 200_000)
     }
 
     private static func benchmarkSQLite(
@@ -51,7 +51,7 @@ enum PersistedLRUCacheBenchmark {
         let cache = LRUSQLiteCache<Int, Payload>(
             namespace: namespace,
             countLimit: .max,
-            memoryCountLimit: 512,
+            memoryCountLimit: payloads.count,
             compressionThreshold: compressionThreshold,
             cacheRootURL: root
         )
@@ -62,21 +62,24 @@ enum PersistedLRUCacheBenchmark {
             }
         }
 
-        measure("\(label) hot reads", operations: payloads.count) {
-            for payload in payloads {
-                _ = cache.value(forKey: payload.id)
+        let hotReadRepeats = max(5, 10_000 / max(payloads.count, 1))
+        measure("\(label) memory reads", operations: payloads.count * hotReadRepeats) {
+            for _ in 0..<hotReadRepeats {
+                for payload in payloads {
+                    _ = cache.value(forKey: payload.id)
+                }
             }
         }
 
         let reloaded = LRUSQLiteCache<Int, Payload>(
             namespace: namespace,
             countLimit: .max,
-            memoryCountLimit: 512,
+            memoryCountLimit: 1,
             compressionThreshold: compressionThreshold,
             cacheRootURL: root
         )
 
-        measure("\(label) persisted reads", operations: payloads.count) {
+        measure("\(label) cold sqlite reads", operations: payloads.count) {
             for payload in payloads {
                 _ = reloaded.value(forKey: payload.id)
             }

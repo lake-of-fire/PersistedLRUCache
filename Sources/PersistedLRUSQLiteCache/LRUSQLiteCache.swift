@@ -20,12 +20,12 @@ private struct SQLiteCacheEntry: Sendable, Equatable {
     }
 
     init(row: Row) {
-        id = row["id"]
-        data = row["data"]
-        encoding = row["encoding"]
-        let rowCost: Int = row["cost"]
+        id = row[0]
+        data = row[1]
+        encoding = row[2]
+        let rowCost: Int = row[3]
         cost = max(rowCost, 1)
-        lastAccess = row["last_access"]
+        lastAccess = row[4]
     }
 }
 
@@ -52,31 +52,15 @@ private struct SQLiteLRUStore {
 
     func fetch(id: String) throws -> SQLiteCacheEntry? {
         try pool.read { db in
-            try Row.fetchOne(
-                db,
-                sql: """
-                    SELECT id, data, encoding, cost, last_access
-                    FROM cache
-                    WHERE id = ?
-                    LIMIT 1
-                    """,
-                arguments: [id]
-            ).map(SQLiteCacheEntry.init(row:))
+            let statement = try db.cachedStatement(sql: Self.fetchSQL)
+            return try Row.fetchOne(statement, arguments: [id]).map(SQLiteCacheEntry.init(row:))
         }
     }
 
     func exists(id: String) -> Bool {
         (try? pool.read { db in
-            try String.fetchOne(
-                db,
-                sql: """
-                    SELECT id
-                    FROM cache
-                    WHERE id = ?
-                    LIMIT 1
-                    """,
-                arguments: [id]
-            ) != nil
+            let statement = try db.cachedStatement(sql: Self.existsSQL)
+            return try Int.fetchOne(statement, arguments: [id]) != nil
         }) ?? false
     }
 
@@ -86,23 +70,23 @@ private struct SQLiteLRUStore {
         }
     }
 
-    func upsertAndTrim(_ entry: SQLiteCacheEntry, countLimit: Int, totalBytesLimit: Int) throws -> [String] {
+    func upsertAndTrim(
+        _ entry: SQLiteCacheEntry,
+        pendingAccesses: [String: Int64],
+        countLimit: Int,
+        totalBytesLimit: Int
+    ) throws -> [String] {
         try pool.write { db in
+            try Self.updateLastAccesses(pendingAccesses, in: db)
             try Self.upsert(entry, in: db)
             return try Self.trim(countLimit: countLimit, totalBytesLimit: totalBytesLimit, in: db)
         }
     }
 
-    func updateLastAccess(id: String, lastAccess: Int64) throws {
+    func updateLastAccesses(_ accesses: [String: Int64]) throws {
+        guard !accesses.isEmpty else { return }
         try pool.write { db in
-            try db.execute(
-                sql: """
-                    UPDATE cache
-                    SET last_access = ?
-                    WHERE id = ?
-                    """,
-                arguments: [lastAccess, id]
-            )
+            try Self.updateLastAccesses(accesses, in: db)
         }
     }
 
@@ -154,9 +138,7 @@ private struct SQLiteLRUStore {
                     arguments: [overflowCount]
                 )
 
-                for id in ids {
-                    try Self.removeByID(id, in: db)
-                }
+                try Self.removeByIDs(ids, in: db)
                 evictedIDs.append(contentsOf: ids)
             }
         }
@@ -166,7 +148,7 @@ private struct SQLiteLRUStore {
             var totalCost = try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(cost), 0) FROM cache") ?? 0
 
             if totalCost > effectiveTotalBytesLimit {
-                let rows = try Row.fetchAll(
+                let rows = try Row.fetchCursor(
                     db,
                     sql: """
                         SELECT id, cost
@@ -175,14 +157,17 @@ private struct SQLiteLRUStore {
                         """
                 )
 
-                for row in rows where totalCost > effectiveTotalBytesLimit {
-                    let id: String = row["id"]
-                    let rowCost: Int = row["cost"]
+                var idsToRemove: [String] = []
+                while totalCost > effectiveTotalBytesLimit, let row = try rows.next() {
+                    let id: String = row[0]
+                    let rowCost: Int = row[1]
                     let cost = max(rowCost, 1)
-                    try Self.removeByID(id, in: db)
-                    evictedIDs.append(id)
+                    idsToRemove.append(id)
                     totalCost -= cost
                 }
+
+                try Self.removeByIDs(idsToRemove, in: db)
+                evictedIDs.append(contentsOf: idsToRemove)
             }
         }
 
@@ -236,33 +221,86 @@ private struct SQLiteLRUStore {
             }
         }
 
-        try db.execute(sql: "CREATE INDEX IF NOT EXISTS cache_last_access_idx ON cache(last_access)")
+        try db.execute(sql: "CREATE INDEX IF NOT EXISTS cache_last_access_id_idx ON cache(last_access, id)")
+        try db.execute(sql: "DROP INDEX IF EXISTS cache_last_access_idx")
     }
 
     private static func removeByID(_ id: String, in db: Database) throws {
-        try db.execute(
-            sql: """
-                DELETE FROM cache
-                WHERE id = ?
-                """,
-            arguments: [id]
-        )
+        let statement = try db.cachedStatement(sql: Self.removeByIDSQL)
+        try statement.execute(arguments: [id])
+    }
+
+    private static func removeByIDs(_ ids: [String], in db: Database) throws {
+        guard !ids.isEmpty else { return }
+
+        let uniqueIDs = Array(Set(ids))
+        let batchSize = 500
+        var startIndex = uniqueIDs.startIndex
+
+        while startIndex < uniqueIDs.endIndex {
+            let endIndex = uniqueIDs.index(
+                startIndex,
+                offsetBy: batchSize,
+                limitedBy: uniqueIDs.endIndex
+            ) ?? uniqueIDs.endIndex
+            let batch = Array(uniqueIDs[startIndex..<endIndex])
+            let questionMarks = databaseQuestionMarks(count: batch.count)
+            try db.execute(
+                sql: "DELETE FROM cache WHERE id IN (\(questionMarks))",
+                arguments: StatementArguments(batch)
+            )
+            startIndex = endIndex
+        }
+    }
+
+    private static func updateLastAccesses(_ accesses: [String: Int64], in db: Database) throws {
+        guard !accesses.isEmpty else { return }
+
+        let statement = try db.cachedStatement(sql: Self.updateLastAccessSQL)
+        for (id, lastAccess) in accesses {
+            try statement.execute(arguments: [lastAccess, id])
+        }
     }
 
     private static func upsert(_ entry: SQLiteCacheEntry, in db: Database) throws {
-        try db.execute(
-            sql: """
-                INSERT INTO cache(id, data, encoding, cost, last_access)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    data = excluded.data,
-                    encoding = excluded.encoding,
-                    cost = excluded.cost,
-                    last_access = excluded.last_access
-                """,
-            arguments: [entry.id, entry.data, entry.encoding, entry.cost, entry.lastAccess]
-        )
+        let statement = try db.cachedStatement(sql: Self.upsertSQL)
+        try statement.execute(arguments: [entry.id, entry.data, entry.encoding, entry.cost, entry.lastAccess])
     }
+
+    private static let fetchSQL = """
+        SELECT id, data, encoding, cost, last_access
+        FROM cache
+        WHERE id = ?
+        LIMIT 1
+        """
+
+    private static let existsSQL = """
+        SELECT 1
+        FROM cache
+        WHERE id = ?
+        LIMIT 1
+        """
+
+    private static let removeByIDSQL = """
+        DELETE FROM cache
+        WHERE id = ?
+        """
+
+    private static let updateLastAccessSQL = """
+        UPDATE cache
+        SET last_access = ?
+        WHERE id = ?
+        """
+
+    private static let upsertSQL = """
+        INSERT INTO cache(id, data, encoding, cost, last_access)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            data = excluded.data,
+            encoding = excluded.encoding,
+            cost = excluded.cost,
+            last_access = excluded.last_access
+        """
 }
 
 /// An SQLite-backed persisted cache with an in-memory LRU front cache.
@@ -280,9 +318,15 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
     private let store: SQLiteLRUStore?
     private let lock = NSRecursiveLock()
     private var lastAccessCounter: Int64 = 0
+    private var pendingLastAccesses: [String: Int64] = [:]
+    private let pendingAccessFlushCount = 256
 
     private var jsonEncoder: JSONEncoder {
         PersistedLRUCacheSupport.jsonEncoder()
+    }
+
+    deinit {
+        flushPendingAccesses()
     }
 
     public init(
@@ -337,12 +381,14 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
     public func removeValue(forKey key: I) {
         guard let keyHash = cacheKeyHash(key) else { return }
         removeMemoryValue(forKeyHash: keyHash)
+        discardPendingAccess(forKeyHash: keyHash)
         try? store?.removeByID(keyHash)
     }
 
     public func removeAll() {
         lock.lock()
         cache.removeAll()
+        pendingLastAccesses.removeAll(keepingCapacity: true)
         lock.unlock()
 
         try? store?.removeAll()
@@ -364,7 +410,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         guard let keyHash = cacheKeyHash(key) else { return nil }
 
         if let cached = memoryValue(forKeyHash: keyHash) {
-            try? store?.updateLastAccess(id: keyHash, lastAccess: nextLastAccess())
+            recordPersistentAccess(forKeyHash: keyHash)
             return cached
         }
 
@@ -377,7 +423,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
             setMemoryValue(decoded, forKeyHash: keyHash, cost: entry.cost)
         }
 
-        try? store?.updateLastAccess(id: keyHash, lastAccess: nextLastAccess())
+        recordPersistentAccess(forKeyHash: keyHash)
         return decoded ?? nil
     }
 
@@ -407,6 +453,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         do {
             if let evictedIDs = try store?.upsertAndTrim(
                 entry,
+                pendingAccesses: takePendingAccesses(),
                 countLimit: countLimit,
                 totalBytesLimit: totalBytesLimit
             ) {
@@ -456,6 +503,44 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         lock.lock()
         cache.removeValue(forKey: keyHash)
         lock.unlock()
+    }
+
+    private func recordPersistentAccess(forKeyHash keyHash: String) {
+        let pendingAccessesToFlush: [String: Int64]?
+
+        lock.lock()
+        lastAccessCounter = max(lastAccessCounter + 1, monotonicTime())
+        pendingLastAccesses[keyHash] = lastAccessCounter
+        if pendingLastAccesses.count >= pendingAccessFlushCount {
+            pendingAccessesToFlush = pendingLastAccesses
+            pendingLastAccesses.removeAll(keepingCapacity: true)
+        } else {
+            pendingAccessesToFlush = nil
+        }
+        lock.unlock()
+
+        if let pendingAccessesToFlush {
+            try? store?.updateLastAccesses(pendingAccessesToFlush)
+        }
+    }
+
+    private func takePendingAccesses() -> [String: Int64] {
+        lock.lock()
+        defer { lock.unlock() }
+        let pendingAccesses = pendingLastAccesses
+        pendingLastAccesses.removeAll(keepingCapacity: true)
+        return pendingAccesses
+    }
+
+    private func discardPendingAccess(forKeyHash keyHash: String) {
+        lock.lock()
+        pendingLastAccesses.removeValue(forKey: keyHash)
+        lock.unlock()
+    }
+
+    private func flushPendingAccesses() {
+        let pendingAccesses = takePendingAccesses()
+        try? store?.updateLastAccesses(pendingAccesses)
     }
 
     private func nextLastAccess() -> Int64 {

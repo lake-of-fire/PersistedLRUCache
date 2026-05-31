@@ -123,6 +123,35 @@ final class LRUSQLiteCacheTests: XCTestCase {
         XCTAssertEqual(cache.value(forKey: "c"), "C")
     }
 
+    func testDeferredReadAccessFlushesBeforeNextInstanceTrims() throws {
+        let root = try makeTemporaryRoot()
+        let namespace = makeNamespace()
+
+        var cache: LRUSQLiteCache<String, String>? = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 2,
+            cacheRootURL: root
+        )
+        cache?.setValue("A", forKey: "a")
+        cache?.setValue("B", forKey: "b")
+        XCTAssertEqual(cache?.value(forKey: "a"), "A")
+        cache = nil
+
+        let reloaded = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 2,
+            cacheRootURL: root
+        )
+        reloaded.setValue("C", forKey: "c")
+
+        XCTAssertEqual(reloaded.value(forKey: "a"), "A")
+        XCTAssertNil(reloaded.value(forKey: "b"))
+        XCTAssertFalse(reloaded.containsKey("b"))
+        XCTAssertEqual(reloaded.value(forKey: "c"), "C")
+    }
+
     func testPersistentTotalBytesLimitEvictsOldestRows() throws {
         let root = try makeTemporaryRoot()
         let namespace = makeNamespace()
