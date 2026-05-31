@@ -46,8 +46,11 @@ let package = Package(
         .target(
             name: "PersistedLRUCache",
             dependencies: [
+                "PersistedLRUCacheCore",
                 "PersistedLRUFileCache",
                 "PersistedLRUSQLiteCache",
+                .product(name: "GRDB", package: "GRDB.swift"),
+                .product(name: "LRUCache", package: "LRUCache"),
             ]
         ),
         .testTarget(
@@ -57,6 +60,10 @@ let package = Package(
         .testTarget(
             name: "PersistedLRUCacheCoreTests",
             dependencies: ["PersistedLRUCacheCore"]
+        ),
+        .testTarget(
+            name: "PersistedLRUCacheTests",
+            dependencies: ["PersistedLRUCache"]
         ),
         .testTarget(
             name: "PersistedLRUSQLiteCacheTests",
