@@ -11,7 +11,7 @@ let package = Package(
     products: [
         .library(
             name: "PersistedLRUCache",
-            targets: ["PersistedLRUCache"]
+            targets: ["PersistedLRUCacheHybrid"]
         ),
         .library(
             name: "PersistedLRUFileCache",
@@ -44,7 +44,7 @@ let package = Package(
             ]
         ),
         .target(
-            name: "PersistedLRUCache",
+            name: "PersistedLRUCacheHybrid",
             dependencies: [
                 "PersistedLRUCacheCore",
                 "PersistedLRUFileCache",
@@ -63,7 +63,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PersistedLRUCacheTests",
-            dependencies: ["PersistedLRUCache"]
+            dependencies: ["PersistedLRUCacheHybrid"]
         ),
         .testTarget(
             name: "PersistedLRUSQLiteCacheTests",

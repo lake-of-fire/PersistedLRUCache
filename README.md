@@ -13,7 +13,7 @@ These caches support iOS 15+ and macOS 15+.
 ## Usage
 
 ```swift
-import PersistedLRUCache
+import PersistedLRUCacheHybrid
 
 let cache = PersistedLRUCache<String, Data>(
     namespace: "reader-content",

@@ -1,5 +1,5 @@
 import XCTest
-@testable import PersistedLRUCache
+@testable import PersistedLRUCacheHybrid
 
 final class PersistedLRUCacheTests: XCTestCase {
     func testSmallValuesPersistInlineAndLargeValuesPersistAsFiles() throws {
