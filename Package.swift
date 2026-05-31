@@ -55,6 +55,10 @@ let package = Package(
             dependencies: ["PersistedLRUFileCache"]
         ),
         .testTarget(
+            name: "PersistedLRUCacheCoreTests",
+            dependencies: ["PersistedLRUCacheCore"]
+        ),
+        .testTarget(
             name: "PersistedLRUSQLiteCacheTests",
             dependencies: ["PersistedLRUSQLiteCache"]
         ),

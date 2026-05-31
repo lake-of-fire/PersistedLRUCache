@@ -181,7 +181,7 @@ open class LRUFileCache<I: Encodable, O: Codable>: ObservableObject {
     }
 
     private func cacheKeyHash(_ key: I) -> String? {
-        PersistedLRUCacheSupport.cacheKeyHash(key, encoder: jsonEncoder)
+        PersistedLRUCacheSupport.cacheKeyHash(key)
     }
 
     private func fileURL(forKeyHash keyHash: String) -> URL? {

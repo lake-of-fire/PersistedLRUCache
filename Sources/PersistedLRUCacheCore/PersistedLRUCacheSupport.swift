@@ -19,8 +19,32 @@ package enum PersistedLRUCacheSupport {
         bundleInfo("CFBundleVersion")
     }
 
+    package static func cacheKeyHash<I: Encodable>(_ key: I) -> String? {
+        cacheKeyHash(key) {
+            jsonEncoder()
+        }
+    }
+
     package static func cacheKeyHash<I: Encodable>(_ key: I, encoder: JSONEncoder) -> String? {
-        guard let data = try? encoder.encode(key) else { return nil }
+        cacheKeyHash(key) {
+            encoder
+        }
+    }
+
+    private static func cacheKeyHash<I: Encodable>(_ key: I, makeEncoder: () -> JSONEncoder) -> String? {
+        let data: Data
+        if let fastData = fastJSONEncodedKeyData(key) {
+            data = fastData
+        } else if let encodedData = try? makeEncoder().encode(key) {
+            data = encodedData
+        } else {
+            return nil
+        }
+
+        return cacheKeyHash(encodedData: data)
+    }
+
+    package static func cacheKeyHash(encodedData data: Data) -> String {
         let hash = stableHash(data)
         var hashData = withUnsafeBytes(of: hash) { Data($0) }
         while hashData.first == 0 { hashData.removeFirst() }
@@ -52,6 +76,62 @@ package enum PersistedLRUCacheSupport {
 
     private static func bundleInfo(_ key: String) -> String {
         Bundle.main.infoDictionary?[key] as? String ?? "UNKNOWN-VERSION"
+    }
+
+    private static func fastJSONEncodedKeyData<I: Encodable>(_ key: I) -> Data? {
+        switch key {
+        case let value as String:
+            return fastJSONStringData(value)
+        case let value as URL:
+            return fastJSONStringData(value.absoluteString)
+        case let value as UUID:
+            return fastJSONStringData(value.uuidString)
+        case let value as Bool:
+            return Data(value ? "true".utf8 : "false".utf8)
+        case let value as Int:
+            return Data(String(value).utf8)
+        case let value as Int8:
+            return Data(String(value).utf8)
+        case let value as Int16:
+            return Data(String(value).utf8)
+        case let value as Int32:
+            return Data(String(value).utf8)
+        case let value as Int64:
+            return Data(String(value).utf8)
+        case let value as UInt:
+            return Data(String(value).utf8)
+        case let value as UInt8:
+            return Data(String(value).utf8)
+        case let value as UInt16:
+            return Data(String(value).utf8)
+        case let value as UInt32:
+            return Data(String(value).utf8)
+        case let value as UInt64:
+            return Data(String(value).utf8)
+        default:
+            return nil
+        }
+    }
+
+    private static func fastJSONStringData(_ value: String) -> Data? {
+        var output = [UInt8]()
+        output.reserveCapacity(value.utf8.count + 2)
+        output.append(UInt8(ascii: "\""))
+
+        for byte in value.utf8 {
+            switch byte {
+            case UInt8(ascii: "\""), UInt8(ascii: "\\"):
+                output.append(UInt8(ascii: "\\"))
+                output.append(byte)
+            case 0x00...0x1f:
+                return nil
+            default:
+                output.append(byte)
+            }
+        }
+
+        output.append(UInt8(ascii: "\""))
+        return Data(output)
     }
 
     private static func stableHash(_ data: Data) -> UInt64 {

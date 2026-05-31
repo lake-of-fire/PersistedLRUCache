@@ -29,6 +29,19 @@ private struct SQLiteCacheEntry: Sendable, Equatable {
     }
 }
 
+private struct SQLiteCacheValue: Sendable, Equatable {
+    var data: Data?
+    var encoding: String
+    var cost: Int
+
+    init(row: Row) {
+        data = row[0]
+        encoding = row[1]
+        let rowCost: Int = row[2]
+        cost = max(rowCost, 1)
+    }
+}
+
 private struct SQLiteLRUStore {
     private let pool: DatabasePool
 
@@ -50,10 +63,10 @@ private struct SQLiteLRUStore {
         }
     }
 
-    func fetch(id: String) throws -> SQLiteCacheEntry? {
+    func fetch(id: String) throws -> SQLiteCacheValue? {
         try pool.read { db in
             let statement = try db.cachedStatement(sql: Self.fetchSQL)
-            return try Row.fetchOne(statement, arguments: [id]).map(SQLiteCacheEntry.init(row:))
+            return try Row.fetchOne(statement, arguments: [id]).map(SQLiteCacheValue.init(row:))
         }
     }
 
@@ -268,7 +281,7 @@ private struct SQLiteLRUStore {
     }
 
     private static let fetchSQL = """
-        SELECT id, data, encoding, cost, last_access
+        SELECT data, encoding, cost
         FROM cache
         WHERE id = ?
         LIMIT 1
@@ -315,6 +328,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
     private let totalBytesLimit: Int
     private let countLimit: Int
     private let compressionThreshold: Int
+    private let tracksPersistentAccess: Bool
     private let store: SQLiteLRUStore?
     private let lock = NSRecursiveLock()
     private var lastAccessCounter: Int64 = 0
@@ -344,6 +358,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         self.totalBytesLimit = totalBytesLimit
         self.countLimit = countLimit
         self.compressionThreshold = compressionThreshold
+        tracksPersistentAccess = countLimit != .max || totalBytesLimit != .max
 
         let fileManager = FileManager.default
         let cacheRoot = cacheRootURL ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
@@ -410,7 +425,9 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         guard let keyHash = cacheKeyHash(key) else { return nil }
 
         if let cached = memoryValue(forKeyHash: keyHash) {
-            recordPersistentAccess(forKeyHash: keyHash)
+            if tracksPersistentAccess {
+                recordPersistentAccess(forKeyHash: keyHash)
+            }
             return cached
         }
 
@@ -423,7 +440,9 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
             setMemoryValue(decoded, forKeyHash: keyHash, cost: entry.cost)
         }
 
-        recordPersistentAccess(forKeyHash: keyHash)
+        if tracksPersistentAccess {
+            recordPersistentAccess(forKeyHash: keyHash)
+        }
         return decoded ?? nil
     }
 
@@ -453,7 +472,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         do {
             if let evictedIDs = try store?.upsertAndTrim(
                 entry,
-                pendingAccesses: takePendingAccesses(),
+                pendingAccesses: tracksPersistentAccess ? takePendingAccesses() : [:],
                 countLimit: countLimit,
                 totalBytesLimit: totalBytesLimit
             ) {
@@ -474,10 +493,10 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
     }
 
     private func cacheKeyHash(_ key: I) -> String? {
-        PersistedLRUCacheSupport.cacheKeyHash(key, encoder: jsonEncoder)
+        PersistedLRUCacheSupport.cacheKeyHash(key)
     }
 
-    private func payload(from entry: SQLiteCacheEntry) -> PersistedLRUCachePayload {
+    private func payload(from entry: SQLiteCacheValue) -> PersistedLRUCachePayload {
         PersistedLRUCachePayload(data: entry.data, encoding: entry.encoding)
     }
 
@@ -509,7 +528,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         let pendingAccessesToFlush: [String: Int64]?
 
         lock.lock()
-        lastAccessCounter = max(lastAccessCounter + 1, monotonicTime())
+        advanceLastAccessCounter()
         pendingLastAccesses[keyHash] = lastAccessCounter
         if pendingLastAccesses.count >= pendingAccessFlushCount {
             pendingAccessesToFlush = pendingLastAccesses
@@ -546,7 +565,16 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
     private func nextLastAccess() -> Int64 {
         lock.lock()
         defer { lock.unlock() }
-        lastAccessCounter = max(lastAccessCounter + 1, monotonicTime())
+        return advanceLastAccessCounter()
+    }
+
+    @discardableResult
+    private func advanceLastAccessCounter() -> Int64 {
+        if lastAccessCounter == .max {
+            lastAccessCounter = monotonicTime()
+        } else {
+            lastAccessCounter += 1
+        }
         return lastAccessCounter
     }
 
