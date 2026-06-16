@@ -52,6 +52,46 @@ final class PersistedLRUCacheTests: XCTestCase {
         XCTAssertEqual(cache.value(forKey: "b"), String(repeating: "b", count: 32))
     }
 
+    func testLargeCountLimitTrimsOnlyAfterSlackThreshold() throws {
+        let root = try temporaryRoot()
+        let namespace = "threshold-count-limit-\(UUID().uuidString)"
+        let cache = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 100,
+            memoryCountLimit: 8,
+            cacheRootURL: root
+        )
+
+        for index in 0..<164 {
+            cache.setValue("value-\(index)", forKey: "key-\(index)")
+        }
+
+        let beforeThresholdReload = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 100,
+            memoryCountLimit: 8,
+            cacheRootURL: root
+        )
+        XCTAssertEqual(beforeThresholdReload.value(forKey: "key-0"), "value-0")
+        XCTAssertEqual(beforeThresholdReload.value(forKey: "key-163"), "value-163")
+
+        cache.setValue("value-164", forKey: "key-164")
+
+        let afterThresholdReload = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 100,
+            memoryCountLimit: 8,
+            cacheRootURL: root
+        )
+        XCTAssertNil(afterThresholdReload.value(forKey: "key-0"))
+        XCTAssertNil(afterThresholdReload.value(forKey: "key-64"))
+        XCTAssertEqual(afterThresholdReload.value(forKey: "key-65"), "value-65")
+        XCTAssertEqual(afterThresholdReload.value(forKey: "key-164"), "value-164")
+    }
+
     func testReplacingExternalValueWithInlineValueDeletesExternalFile() throws {
         let root = try temporaryRoot()
         let cache = PersistedLRUCache<String, String>(

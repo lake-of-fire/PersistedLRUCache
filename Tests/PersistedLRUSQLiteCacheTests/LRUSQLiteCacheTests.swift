@@ -147,6 +147,46 @@ final class LRUSQLiteCacheTests: XCTestCase {
         XCTAssertEqual(reloaded.value(forKey: "k3"), "3")
     }
 
+    func testLargePersistentCountLimitTrimsOnlyAfterSlackThreshold() throws {
+        let root = try makeTemporaryRoot()
+        let namespace = makeNamespace()
+        let cache = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 100,
+            memoryCountLimit: 8,
+            cacheRootURL: root
+        )
+
+        for index in 0..<164 {
+            cache.setValue("value-\(index)", forKey: "key-\(index)")
+        }
+
+        let beforeThresholdReload = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 100,
+            memoryCountLimit: 8,
+            cacheRootURL: root
+        )
+        XCTAssertEqual(beforeThresholdReload.value(forKey: "key-0"), "value-0")
+        XCTAssertEqual(beforeThresholdReload.value(forKey: "key-163"), "value-163")
+
+        cache.setValue("value-164", forKey: "key-164")
+
+        let afterThresholdReload = LRUSQLiteCache<String, String>(
+            namespace: namespace,
+            totalBytesLimit: .max,
+            countLimit: 100,
+            memoryCountLimit: 8,
+            cacheRootURL: root
+        )
+        XCTAssertNil(afterThresholdReload.value(forKey: "key-0"))
+        XCTAssertNil(afterThresholdReload.value(forKey: "key-64"))
+        XCTAssertEqual(afterThresholdReload.value(forKey: "key-65"), "value-65")
+        XCTAssertEqual(afterThresholdReload.value(forKey: "key-164"), "value-164")
+    }
+
     func testSetValueDoesNotKeepMemoryValueWhenInsertedRowIsTrimmed() throws {
         let root = try makeTemporaryRoot()
         let namespace = makeNamespace()

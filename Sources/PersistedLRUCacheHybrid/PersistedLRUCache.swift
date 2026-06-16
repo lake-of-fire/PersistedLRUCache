@@ -40,6 +40,18 @@ private struct HybridCacheValue: Sendable, Equatable {
 private struct HybridCacheMutationResult: Sendable, Equatable {
     var evictedIDs: [String] = []
     var obsoleteFileNames: [String] = []
+    var itemCountDelta: Int = 0
+    var totalCostDelta: Int = 0
+}
+
+private struct HybridCacheStats: Sendable, Equatable {
+    var count: Int
+    var totalCost: Int
+}
+
+private struct HybridExistingEntry: Sendable, Equatable {
+    var cost: Int
+    var fileName: String?
 }
 
 private struct HybridSQLiteLRUStore {
@@ -98,6 +110,22 @@ private struct HybridSQLiteLRUStore {
         }
     }
 
+    func upsert(_ entry: HybridCacheEntry, pendingAccesses: [String: Int64]) throws -> HybridCacheMutationResult {
+        try pool.write { db in
+            try Self.updateLastAccesses(pendingAccesses, in: db)
+            return try Self.upsert([entry], in: db)
+        }
+    }
+
+    func upsert(_ entries: [HybridCacheEntry], pendingAccesses: [String: Int64]) throws -> HybridCacheMutationResult {
+        guard !entries.isEmpty else { return HybridCacheMutationResult() }
+
+        return try pool.write { db in
+            try Self.updateLastAccesses(pendingAccesses, in: db)
+            return try Self.upsert(entries, in: db)
+        }
+    }
+
     func upsertAndTrim(
         _ entry: HybridCacheEntry,
         pendingAccesses: [String: Int64],
@@ -135,11 +163,29 @@ private struct HybridSQLiteLRUStore {
         }
     }
 
-    func removeByID(_ id: String) throws -> [String] {
+    func trim(countLimit: Int, totalBytesLimit: Int) throws -> HybridCacheMutationResult {
         try pool.write { db in
-            let fileNames = try Self.fileNames(forIDs: [id], in: db)
+            try Self.trim(countLimit: countLimit, totalBytesLimit: totalBytesLimit, in: db)
+        }
+    }
+
+    func cacheStats() throws -> HybridCacheStats {
+        try pool.read { db in
+            try Self.cacheStats(in: db)
+        }
+    }
+
+    func removeByID(_ id: String) throws -> HybridCacheMutationResult {
+        try pool.write { db in
+            let existing = try Self.existingEntries(forIDs: [id], in: db)
+            let fileNames = existing.values.compactMap(\.fileName)
             try Self.removeByIDs([id], in: db)
-            return fileNames
+            let oldCost = existing[id]?.cost ?? 0
+            return HybridCacheMutationResult(
+                obsoleteFileNames: fileNames,
+                itemCountDelta: existing[id] == nil ? 0 : -1,
+                totalCostDelta: -oldCost
+            )
         }
     }
 
@@ -215,6 +261,14 @@ private struct HybridSQLiteLRUStore {
         )
     }
 
+    private static func cacheStats(in db: Database) throws -> HybridCacheStats {
+        let row = try Row.fetchOne(db, sql: "SELECT COUNT(*), COALESCE(SUM(cost), 0) FROM cache")
+        return HybridCacheStats(
+            count: row?[0] ?? 0,
+            totalCost: row?[1] ?? 0
+        )
+    }
+
     private static func ensureSchema(_ db: Database) throws {
         try db.execute(
             sql: """
@@ -262,9 +316,25 @@ private struct HybridSQLiteLRUStore {
         guard !entries.isEmpty else { return HybridCacheMutationResult() }
 
         let ids = orderedUnique(entries.map(\.id))
-        let oldFileNames = try fileNames(forIDs: ids, in: db)
+        let existing = try existingEntries(forIDs: ids, in: db)
+        let oldFileNames = existing.values.compactMap(\.fileName)
         let newFileNames = Set(entries.compactMap(\.fileName))
         let obsoleteFileNames = oldFileNames.filter { !newFileNames.contains($0) }
+        var finalCostByID = [String: Int]()
+        finalCostByID.reserveCapacity(ids.count)
+        for entry in entries {
+            finalCostByID[entry.id] = entry.cost
+        }
+        var itemCountDelta = 0
+        var totalCostDelta = 0
+        for (id, cost) in finalCostByID {
+            if let existing = existing[id] {
+                totalCostDelta += cost - existing.cost
+            } else {
+                itemCountDelta += 1
+                totalCostDelta += cost
+            }
+        }
 
         let statement = try db.cachedStatement(sql: Self.upsertSQL)
         for entry in entries {
@@ -278,7 +348,45 @@ private struct HybridSQLiteLRUStore {
             ])
         }
 
-        return HybridCacheMutationResult(obsoleteFileNames: obsoleteFileNames)
+        return HybridCacheMutationResult(
+            obsoleteFileNames: obsoleteFileNames,
+            itemCountDelta: itemCountDelta,
+            totalCostDelta: totalCostDelta
+        )
+    }
+
+    private static func existingEntries(forIDs ids: [String], in db: Database) throws -> [String: HybridExistingEntry] {
+        let ids = orderedUnique(ids)
+        guard !ids.isEmpty else { return [:] }
+
+        var output = [String: HybridExistingEntry]()
+        output.reserveCapacity(ids.count)
+        let batchSize = 500
+        var startIndex = ids.startIndex
+
+        while startIndex < ids.endIndex {
+            let endIndex = ids.index(
+                startIndex,
+                offsetBy: batchSize,
+                limitedBy: ids.endIndex
+            ) ?? ids.endIndex
+            let batch = Array(ids[startIndex..<endIndex])
+            let questionMarks = sqlQuestionMarks(count: batch.count)
+            let rows = try Row.fetchAll(
+                db,
+                sql: "SELECT id, cost, file_name FROM cache WHERE id IN (\(questionMarks))",
+                arguments: StatementArguments(batch)
+            )
+            for row in rows {
+                let id: String = row[0]
+                let cost: Int = row[1]
+                let fileName: String? = row[2]
+                output[id] = HybridExistingEntry(cost: max(cost, 1), fileName: fileName)
+            }
+            startIndex = endIndex
+        }
+
+        return output
     }
 
     private static func fileNames(forIDs ids: [String], in db: Database) throws -> [String] {
@@ -395,6 +503,8 @@ private extension HybridCacheMutationResult {
     mutating func merge(_ other: HybridCacheMutationResult) {
         evictedIDs.append(contentsOf: other.evictedIDs)
         obsoleteFileNames.append(contentsOf: other.obsoleteFileNames)
+        itemCountDelta += other.itemCountDelta
+        totalCostDelta += other.totalCostDelta
     }
 }
 
@@ -419,6 +529,8 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
     private let lock = NSRecursiveLock()
     private var lastAccessCounter: Int64 = 0
     private var pendingLastAccesses: [String: Int64] = [:]
+    private var approximatePersistentEntryCount = 0
+    private var approximatePersistentTotalCost = 0
     private let pendingAccessFlushCount = 256
 
     private var jsonEncoder: JSONEncoder {
@@ -491,6 +603,10 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
             try Data(versionString.utf8).write(to: versionFileURL)
             self.store = store
             lastAccessCounter = max(monotonicTime(), store.maximumLastAccess())
+            if let stats = try? store.cacheStats() {
+                approximatePersistentEntryCount = stats.count
+                approximatePersistentTotalCost = stats.totalCost
+            }
         } catch {
             print("Failed to initialize PersistedLRUCache store: \(error)")
             self.store = nil
@@ -501,8 +617,9 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         guard let keyHash = cacheKeyHash(key) else { return }
         removeMemoryValue(forKeyHash: keyHash)
         discardPendingAccess(forKeyHash: keyHash)
-        if let fileNames = try? store?.removeByID(keyHash) {
-            removeExternalFiles(fileNames: fileNames)
+        if let result = try? store?.removeByID(keyHash) {
+            applyPersistentStatsDelta(result)
+            removeExternalFiles(fileNames: result.obsoleteFileNames)
         }
     }
 
@@ -515,6 +632,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         if let fileNames = try? store?.removeAll() {
             removeExternalFiles(fileNames: fileNames)
         }
+        resetPersistentStats(HybridCacheStats(count: 0, totalCost: 0))
         removeExternalFilesDirectory()
         try? FileManager.default.createDirectory(at: externalFilesDirectory, withIntermediateDirectories: true)
     }
@@ -582,26 +700,29 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         )
 
         let result: HybridCacheMutationResult
+        let evictedIDs: [String]
         do {
             if tracksPersistentAccess {
-                result = try store?.upsertAndTrim(
+                result = try store?.upsert(
                     entry,
-                    pendingAccesses: takePendingAccesses(),
-                    countLimit: countLimit,
-                    totalBytesLimit: totalBytesLimit
+                    pendingAccesses: takePendingAccesses()
                 ) ?? HybridCacheMutationResult()
             } else {
                 result = try store?.upsert(entry) ?? HybridCacheMutationResult()
             }
+            applyPersistentStatsDelta(result)
             removeExternalFiles(fileNames: result.obsoleteFileNames)
-            removeMemoryValues(forKeyHashes: result.evictedIDs)
+            let trimResult = trimPersistentStoreIfNeeded()
+            removeExternalFiles(fileNames: trimResult.obsoleteFileNames)
+            evictedIDs = result.evictedIDs + trimResult.evictedIDs
+            removeMemoryValues(forKeyHashes: evictedIDs)
         } catch {
             removeExternalFiles(fileNames: encoded.newExternalFileNames)
             print("Persisted cache write error: \(error)")
             return
         }
 
-        if result.evictedIDs.contains(keyHash) {
+        if evictedIDs.contains(keyHash) {
             removeMemoryValue(forKeyHash: keyHash)
         } else if let value, encoded.payload.cost <= memoryThreshold {
             setMemoryValue(value, forKeyHash: keyHash, cost: encoded.payload.cost)
@@ -662,25 +783,28 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         }
 
         let result: HybridCacheMutationResult
+        let evictedIDs: [String]
         do {
             if tracksPersistentAccess {
-                result = try store?.upsertAndTrim(
+                result = try store?.upsert(
                     entries,
-                    pendingAccesses: takePendingAccesses(),
-                    countLimit: countLimit,
-                    totalBytesLimit: totalBytesLimit
+                    pendingAccesses: takePendingAccesses()
                 ) ?? HybridCacheMutationResult()
             } else {
                 result = try store?.upsert(entries) ?? HybridCacheMutationResult()
             }
+            applyPersistentStatsDelta(result)
             removeExternalFiles(fileNames: result.obsoleteFileNames)
+            let trimResult = trimPersistentStoreIfNeeded()
+            removeExternalFiles(fileNames: trimResult.obsoleteFileNames)
+            evictedIDs = result.evictedIDs + trimResult.evictedIDs
         } catch {
             removeExternalFiles(fileNames: newExternalFileNames)
             print("Persisted cache write error: \(error)")
             return
         }
 
-        updateMemoryValues(memoryUpdates, removing: memoryRemovals + result.evictedIDs)
+        updateMemoryValues(memoryUpdates, removing: memoryRemovals + evictedIDs)
     }
 
     public func debugKeyHash(for key: I) -> String? {
@@ -695,6 +819,63 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
             return nil
         }
         return externalFileURL(forFileName: fileName)
+    }
+
+    private func applyPersistentStatsDelta(_ result: HybridCacheMutationResult) {
+        guard tracksPersistentAccess else { return }
+
+        lock.lock()
+        approximatePersistentEntryCount = max(0, approximatePersistentEntryCount + result.itemCountDelta)
+        approximatePersistentTotalCost = max(0, approximatePersistentTotalCost + result.totalCostDelta)
+        lock.unlock()
+    }
+
+    private func resetPersistentStats(_ stats: HybridCacheStats) {
+        lock.lock()
+        approximatePersistentEntryCount = max(0, stats.count)
+        approximatePersistentTotalCost = max(0, stats.totalCost)
+        lock.unlock()
+    }
+
+    private func trimPersistentStoreIfNeeded() -> HybridCacheMutationResult {
+        guard tracksPersistentAccess, shouldTrimPersistentStore(), let store else {
+            return HybridCacheMutationResult()
+        }
+
+        do {
+            let result = try store.trim(countLimit: countLimit, totalBytesLimit: totalBytesLimit)
+            let stats = try store.cacheStats()
+            resetPersistentStats(stats)
+            return result
+        } catch {
+            print("Persisted cache trim error: \(error)")
+            return HybridCacheMutationResult()
+        }
+    }
+
+    private func shouldTrimPersistentStore() -> Bool {
+        lock.lock()
+        let count = approximatePersistentEntryCount
+        let totalCost = approximatePersistentTotalCost
+        lock.unlock()
+
+        if countLimit != .max, count > countLimit + persistentCountTrimSlack {
+            return true
+        }
+        if totalBytesLimit != .max, totalCost > totalBytesLimit + persistentCostTrimSlack {
+            return true
+        }
+        return false
+    }
+
+    private var persistentCountTrimSlack: Int {
+        guard countLimit != .max, countLimit >= 64 else { return 0 }
+        return min(max(countLimit / 16, 64), 8_192)
+    }
+
+    private var persistentCostTrimSlack: Int {
+        guard totalBytesLimit != .max, totalBytesLimit >= 1_048_576 else { return 0 }
+        return min(max(totalBytesLimit / 16, 4_194_304), 67_108_864)
     }
 
     private struct EncodedHybridValue {
