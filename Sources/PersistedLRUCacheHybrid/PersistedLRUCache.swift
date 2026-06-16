@@ -508,6 +508,20 @@ private extension HybridCacheMutationResult {
     }
 }
 
+public enum PersistedLRUCacheWriteMode: Sendable {
+    case immediate
+    case asynchronous(batchDelay: TimeInterval = 0.15)
+
+    var batchDelay: TimeInterval? {
+        switch self {
+        case .immediate:
+            return nil
+        case .asynchronous(let batchDelay):
+            return max(batchDelay, 0)
+        }
+    }
+}
+
 /// A persisted LRU cache backed by SQLite metadata with an in-memory front cache.
 ///
 /// Small encoded values are stored inline in SQLite. Values whose encoded payload
@@ -524,11 +538,15 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
     private let memoryThreshold: Int
     private let compressionThreshold: Int
     private let tracksPersistentAccess: Bool
+    private let writeMode: PersistedLRUCacheWriteMode
     private let externalFilesDirectory: URL
     private let store: HybridSQLiteLRUStore?
     private let lock = NSRecursiveLock()
+    private let writeQueue: DispatchQueue
     private var lastAccessCounter: Int64 = 0
     private var pendingLastAccesses: [String: Int64] = [:]
+    private var pendingPersistentWrites: [String: PendingPersistentWrite] = [:]
+    private var pendingPersistentWriteWorkItem: DispatchWorkItem?
     private var approximatePersistentEntryCount = 0
     private var approximatePersistentTotalCost = 0
     private let pendingAccessFlushCount = 256
@@ -538,6 +556,8 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
     }
 
     deinit {
+        pendingPersistentWriteWorkItem?.cancel()
+        flushPendingPersistentWrites()
         flushPendingAccesses()
     }
 
@@ -551,6 +571,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         memoryCountLimit: Int? = nil,
         inlineStorageThreshold: Int = 256_000,
         compressionThreshold: Int = 200_000,
+        writeMode: PersistedLRUCacheWriteMode = .immediate,
         cacheRootURL: URL? = nil
     ) {
         assert(!namespace.isEmpty, "PersistedLRUCache namespace must not be empty")
@@ -560,6 +581,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         self.inlineStorageThreshold = max(inlineStorageThreshold, 0)
         self.memoryThreshold = memoryThreshold
         self.compressionThreshold = compressionThreshold
+        self.writeMode = writeMode
         tracksPersistentAccess = countLimit != .max || totalBytesLimit != .max
 
         let fileManager = FileManager.default
@@ -568,6 +590,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         let filesDirectory = cacheDirectory.appendingPathComponent("files", isDirectory: true)
         self.cacheDirectory = cacheDirectory
         externalFilesDirectory = filesDirectory
+        writeQueue = DispatchQueue(label: "PersistedLRUCache.write.\(namespace)", qos: .utility)
         cache = LRUCache(
             totalCostLimit: memoryTotalBytesLimit ?? min(totalBytesLimit, memoryThreshold),
             countLimit: memoryCountLimit ?? countLimit
@@ -615,6 +638,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
 
     public func removeValue(forKey key: I) {
         guard let keyHash = cacheKeyHash(key) else { return }
+        discardPendingPersistentWrite(forKeyHash: keyHash)
         removeMemoryValue(forKeyHash: keyHash)
         discardPendingAccess(forKeyHash: keyHash)
         if let result = try? store?.removeByID(keyHash) {
@@ -624,6 +648,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
     }
 
     public func removeAll() {
+        cancelPendingPersistentWritesRemovingNewFiles()
         lock.lock()
         cache.removeAll()
         pendingLastAccesses.removeAll(keepingCapacity: true)
@@ -644,6 +669,9 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
     public func containsKey(_ key: I) -> Bool {
         guard let keyHash = cacheKeyHash(key) else { return false }
         if hasMemoryValue(forKeyHash: keyHash) {
+            return true
+        }
+        if hasPendingPersistentWrite(forKeyHash: keyHash) {
             return true
         }
         return store?.exists(id: keyHash) ?? false
@@ -699,28 +727,20 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
             lastAccess: nextLastAccess()
         )
 
-        let result: HybridCacheMutationResult
-        let evictedIDs: [String]
-        do {
-            if tracksPersistentAccess {
-                result = try store?.upsert(
-                    entry,
-                    pendingAccesses: takePendingAccesses()
-                ) ?? HybridCacheMutationResult()
+        if writeMode.batchDelay != nil {
+            enqueuePersistentWrite(entry: entry, newExternalFileNames: encoded.newExternalFileNames)
+            if let value, encoded.payload.cost <= memoryThreshold {
+                setMemoryValue(value, forKeyHash: keyHash, cost: encoded.payload.cost)
             } else {
-                result = try store?.upsert(entry) ?? HybridCacheMutationResult()
+                removeMemoryValue(forKeyHash: keyHash)
             }
-            applyPersistentStatsDelta(result)
-            removeExternalFiles(fileNames: result.obsoleteFileNames)
-            let trimResult = trimPersistentStoreIfNeeded()
-            removeExternalFiles(fileNames: trimResult.obsoleteFileNames)
-            evictedIDs = result.evictedIDs + trimResult.evictedIDs
-            removeMemoryValues(forKeyHashes: evictedIDs)
-        } catch {
-            removeExternalFiles(fileNames: encoded.newExternalFileNames)
-            print("Persisted cache write error: \(error)")
             return
         }
+
+        let evictedIDs = persistEntriesSynchronously(
+            [entry],
+            newExternalFileNamesOnFailure: encoded.newExternalFileNames
+        )
 
         if evictedIDs.contains(keyHash) {
             removeMemoryValue(forKeyHash: keyHash)
@@ -768,43 +788,40 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
 
         let lastAccesses = nextLastAccesses(count: encodedValues.count)
         var entries: [HybridCacheEntry] = []
+        var pendingWrites: [(entry: HybridCacheEntry, newExternalFileNames: [String])] = []
         entries.reserveCapacity(encodedValues.count)
+        pendingWrites.reserveCapacity(encodedValues.count)
         for (offset, encodedValue) in encodedValues.enumerated() {
-            entries.append(
-                HybridCacheEntry(
-                    id: encodedValue.keyHash,
-                    data: encodedValue.encoded.inlineData,
-                    fileName: encodedValue.encoded.fileName,
-                    encoding: encodedValue.encoded.payload.encoding,
-                    cost: encodedValue.encoded.payload.cost,
-                    lastAccess: lastAccesses[offset]
-                )
+            let entry = HybridCacheEntry(
+                id: encodedValue.keyHash,
+                data: encodedValue.encoded.inlineData,
+                fileName: encodedValue.encoded.fileName,
+                encoding: encodedValue.encoded.payload.encoding,
+                cost: encodedValue.encoded.payload.cost,
+                lastAccess: lastAccesses[offset]
             )
+            entries.append(entry)
+            pendingWrites.append((entry: entry, newExternalFileNames: encodedValue.encoded.newExternalFileNames))
         }
 
-        let result: HybridCacheMutationResult
-        let evictedIDs: [String]
-        do {
-            if tracksPersistentAccess {
-                result = try store?.upsert(
-                    entries,
-                    pendingAccesses: takePendingAccesses()
-                ) ?? HybridCacheMutationResult()
-            } else {
-                result = try store?.upsert(entries) ?? HybridCacheMutationResult()
-            }
-            applyPersistentStatsDelta(result)
-            removeExternalFiles(fileNames: result.obsoleteFileNames)
-            let trimResult = trimPersistentStoreIfNeeded()
-            removeExternalFiles(fileNames: trimResult.obsoleteFileNames)
-            evictedIDs = result.evictedIDs + trimResult.evictedIDs
-        } catch {
-            removeExternalFiles(fileNames: newExternalFileNames)
-            print("Persisted cache write error: \(error)")
+        if writeMode.batchDelay != nil {
+            enqueuePersistentWrites(pendingWrites)
+            updateMemoryValues(memoryUpdates, removing: memoryRemovals)
             return
         }
 
+        let evictedIDs = persistEntriesSynchronously(
+            entries,
+            newExternalFileNamesOnFailure: newExternalFileNames
+        )
+
         updateMemoryValues(memoryUpdates, removing: memoryRemovals + evictedIDs)
+    }
+
+    public func flushPendingWrites() {
+        pendingPersistentWriteWorkItem?.cancel()
+        flushPendingPersistentWrites()
+        flushPendingAccesses()
     }
 
     public func debugKeyHash(for key: I) -> String? {
@@ -851,6 +868,129 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
             print("Persisted cache trim error: \(error)")
             return HybridCacheMutationResult()
         }
+    }
+
+    @discardableResult
+    private func persistEntriesSynchronously(
+        _ entries: [HybridCacheEntry],
+        newExternalFileNamesOnFailure: [String]
+    ) -> [String] {
+        guard !entries.isEmpty else { return [] }
+
+        do {
+            let result: HybridCacheMutationResult
+            if tracksPersistentAccess {
+                result = try store?.upsert(
+                    entries,
+                    pendingAccesses: takePendingAccesses()
+                ) ?? HybridCacheMutationResult()
+            } else {
+                result = try store?.upsert(entries) ?? HybridCacheMutationResult()
+            }
+            applyPersistentStatsDelta(result)
+            removeExternalFiles(fileNames: result.obsoleteFileNames)
+            let trimResult = trimPersistentStoreIfNeeded()
+            removeExternalFiles(fileNames: trimResult.obsoleteFileNames)
+            let evictedIDs = result.evictedIDs + trimResult.evictedIDs
+            removeMemoryValues(forKeyHashes: evictedIDs)
+            return evictedIDs
+        } catch {
+            removeExternalFiles(fileNames: newExternalFileNamesOnFailure)
+            print("Persisted cache write error: \(error)")
+            return []
+        }
+    }
+
+    private struct PendingPersistentWrite {
+        var entry: HybridCacheEntry
+        var newExternalFileNames: [String]
+    }
+
+    private func hasPendingPersistentWrite(forKeyHash keyHash: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return pendingPersistentWrites[keyHash] != nil
+    }
+
+    private func enqueuePersistentWrite(entry: HybridCacheEntry, newExternalFileNames: [String]) {
+        enqueuePersistentWrites([(entry: entry, newExternalFileNames: newExternalFileNames)])
+    }
+
+    private func enqueuePersistentWrites(_ writes: [(entry: HybridCacheEntry, newExternalFileNames: [String])]) {
+        guard !writes.isEmpty else { return }
+
+        let delay = writeMode.batchDelay ?? 0
+        var replacedExternalFileNames: [String] = []
+
+        lock.lock()
+        for (entry, newExternalFileNames) in writes {
+            if let pendingWrite = pendingPersistentWrites[entry.id] {
+                replacedExternalFileNames.append(contentsOf: pendingWrite.newExternalFileNames)
+            }
+            pendingPersistentWrites[entry.id] = PendingPersistentWrite(
+                entry: entry,
+                newExternalFileNames: newExternalFileNames
+            )
+        }
+
+        if pendingPersistentWriteWorkItem == nil {
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.flushPendingPersistentWrites()
+            }
+            pendingPersistentWriteWorkItem = workItem
+            writeQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
+        lock.unlock()
+
+        removeExternalFiles(fileNames: replacedExternalFileNames)
+    }
+
+    private func discardPendingPersistentWrite(forKeyHash keyHash: String) {
+        let newExternalFileNames: [String]
+
+        lock.lock()
+        newExternalFileNames = pendingPersistentWrites.removeValue(forKey: keyHash)?.newExternalFileNames ?? []
+        lock.unlock()
+
+        removeExternalFiles(fileNames: newExternalFileNames)
+    }
+
+    private func cancelPendingPersistentWritesRemovingNewFiles() {
+        let newExternalFileNames: [String]
+
+        lock.lock()
+        pendingPersistentWriteWorkItem?.cancel()
+        pendingPersistentWriteWorkItem = nil
+        newExternalFileNames = pendingPersistentWrites.values.flatMap(\.newExternalFileNames)
+        pendingPersistentWrites.removeAll(keepingCapacity: true)
+        lock.unlock()
+
+        removeExternalFiles(fileNames: newExternalFileNames)
+    }
+
+    private func takePendingPersistentWrites() -> [PendingPersistentWrite] {
+        lock.lock()
+        defer { lock.unlock() }
+        let writes = Array(pendingPersistentWrites.values)
+            .sorted { lhs, rhs in
+                if lhs.entry.lastAccess == rhs.entry.lastAccess {
+                    return lhs.entry.id < rhs.entry.id
+                }
+                return lhs.entry.lastAccess < rhs.entry.lastAccess
+            }
+        pendingPersistentWrites.removeAll(keepingCapacity: true)
+        pendingPersistentWriteWorkItem = nil
+        return writes
+    }
+
+    private func flushPendingPersistentWrites() {
+        let writes = takePendingPersistentWrites()
+        guard !writes.isEmpty else { return }
+
+        _ = persistEntriesSynchronously(
+            writes.map(\.entry),
+            newExternalFileNamesOnFailure: writes.flatMap(\.newExternalFileNames)
+        )
     }
 
     private func shouldTrimPersistentStore() -> Bool {

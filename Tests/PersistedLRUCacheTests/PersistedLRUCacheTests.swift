@@ -138,6 +138,67 @@ final class PersistedLRUCacheTests: XCTestCase {
         XCTAssertNotNil(reloaded.debugDiskEntryURL(for: 2))
     }
 
+    func testAsynchronousWritesUpdateMemoryImmediatelyAndPersistOnFlush() throws {
+        let root = try temporaryRoot()
+        let namespace = "async-\(UUID().uuidString)"
+        let cache = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            compressionThreshold: .max,
+            writeMode: .asynchronous(batchDelay: 60),
+            cacheRootURL: root
+        )
+
+        cache.setValue("value", forKey: "key")
+
+        XCTAssertEqual(cache.value(forKey: "key"), "value")
+        XCTAssertNil(
+            PersistedLRUCache<String, String>(
+                namespace: namespace,
+                compressionThreshold: .max,
+                cacheRootURL: root
+            )
+            .value(forKey: "key")
+        )
+
+        cache.flushPendingWrites()
+
+        XCTAssertEqual(
+            PersistedLRUCache<String, String>(
+                namespace: namespace,
+                compressionThreshold: .max,
+                cacheRootURL: root
+            )
+            .value(forKey: "key"),
+            "value"
+        )
+    }
+
+    func testAsynchronousWritesCoalesceDuplicateKeysBeforePersisting() throws {
+        let root = try temporaryRoot()
+        let namespace = "async-coalesce-\(UUID().uuidString)"
+        let cache = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            writeMode: .asynchronous(batchDelay: 60),
+            cacheRootURL: root
+        )
+
+        cache.setValue(String(repeating: "a", count: 32), forKey: "key")
+        cache.setValue("small", forKey: "key")
+        cache.flushPendingWrites()
+
+        let reloaded = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        XCTAssertEqual(reloaded.value(forKey: "key"), "small")
+        XCTAssertNil(reloaded.debugDiskEntryURL(for: "key"))
+        XCTAssertEqual(try externalFileNames(root: root, namespace: namespace), [])
+    }
+
     func testRemoveAllDeletesExternalFiles() throws {
         let root = try temporaryRoot()
         let cache = PersistedLRUCache<String, String>(
@@ -161,5 +222,18 @@ final class PersistedLRUCacheTests: XCTestCase {
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         return root
+    }
+
+    private func externalFileNames(root: URL, namespace: String) throws -> [String] {
+        let filesURL = root
+            .appendingPathComponent("PersistedLRUCache")
+            .appendingPathComponent(namespace)
+            .appendingPathComponent("files", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: filesURL.path) else {
+            return []
+        }
+        return try FileManager.default
+            .contentsOfDirectory(atPath: filesURL.path)
+            .sorted()
     }
 }
