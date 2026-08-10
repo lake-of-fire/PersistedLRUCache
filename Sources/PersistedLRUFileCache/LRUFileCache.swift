@@ -103,14 +103,21 @@ open class LRUFileCache<I: Encodable, O: Codable>: ObservableObject {
         }
 
         let payload = payload(from: fileURL)
-        guard let decoded = try? PersistedLRUCacheCodec.decode(O.self, from: payload) else {
+        let decoded: O?
+        do {
+            decoded = try PersistedLRUCacheCodec.decode(O.self, from: payload)
+        } catch {
+            cache.removeValue(forKey: keyHash)
+            removeFiles(forKeyHash: keyHash)
+            diskOnlyKeys.remove(keyHash)
             return nil
         }
 
-        if payload.cost <= memoryThreshold {
+        if let decoded, payload.cost <= memoryThreshold {
             cache.setValue(decoded, forKey: keyHash, cost: payload.cost)
             diskOnlyKeys.remove(keyHash)
         } else {
+            cache.removeValue(forKey: keyHash)
             diskOnlyKeys.insert(keyHash)
         }
 

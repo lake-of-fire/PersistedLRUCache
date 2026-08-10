@@ -8,6 +8,22 @@ final class LRUFileCacheTests: XCTestCase {
         var values: [Int]
     }
 
+    func testUndecodablePersistedValueIsEvictedOnRead() throws {
+        let root = try makeTemporaryRoot()
+        let namespace = makeNamespace()
+
+        let writer = LRUFileCache<String, Record>(namespace: namespace, cacheRootURL: root)
+        writer.setValue(Record(title: "old schema", values: [1, 2, 3]), forKey: "page")
+
+        let reader = LRUFileCache<String, String>(namespace: namespace, cacheRootURL: root)
+        XCTAssertTrue(reader.containsKey("page"))
+        XCTAssertNil(reader.value(forKey: "page"))
+        XCTAssertFalse(reader.containsKey("page"))
+
+        let reloaded = LRUFileCache<String, String>(namespace: namespace, cacheRootURL: root)
+        XCTAssertFalse(reloaded.containsKey("page"))
+    }
+
     func testStringValuePersistsAcrossInstances() throws {
         let root = try makeTemporaryRoot()
         let namespace = makeNamespace()

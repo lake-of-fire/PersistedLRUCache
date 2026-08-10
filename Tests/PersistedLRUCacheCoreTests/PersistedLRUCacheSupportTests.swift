@@ -3,6 +3,39 @@ import Foundation
 import XCTest
 
 final class PersistedLRUCacheSupportTests: XCTestCase {
+    func testCodecDistinguishesStoredNilFromMalformedPayloads() throws {
+        XCTAssertNil(
+            try PersistedLRUCacheCodec.decode(
+                String.self,
+                from: PersistedLRUCachePayload(data: nil, encoding: "nil")
+            )
+        )
+
+        XCTAssertThrowsError(
+            try PersistedLRUCacheCodec.decode(
+                String.self,
+                from: PersistedLRUCachePayload(data: nil, encoding: "json")
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? PersistedLRUCacheCodecError,
+                .missingData(encoding: "json")
+            )
+        }
+
+        XCTAssertThrowsError(
+            try PersistedLRUCacheCodec.decode(
+                String.self,
+                from: PersistedLRUCachePayload(data: Data("value".utf8), encoding: "unknown")
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? PersistedLRUCacheCodecError,
+                .unsupportedEncoding("unknown")
+            )
+        }
+    }
+
     func testCacheKeyFastPathsMatchPackageJSONEncoderHashing() throws {
         try assertFastHashMatchesJSONEncoder("plain")
         try assertFastHashMatchesJSONEncoder("https://example.com/path/to/file?q=1")

@@ -2,6 +2,58 @@ import XCTest
 @testable import PersistedLRUCacheHybrid
 
 final class PersistedLRUCacheTests: XCTestCase {
+    struct Record: Codable, Equatable {
+        var title: String
+        var values: [Int]
+    }
+
+    func testUndecodableInlineValueIsEvictedOnRead() throws {
+        let root = try temporaryRoot()
+        let namespace = "decode-inline-\(UUID().uuidString)"
+
+        let writer = PersistedLRUCache<String, Record>(
+            namespace: namespace,
+            inlineStorageThreshold: .max,
+            cacheRootURL: root
+        )
+        writer.setValue(Record(title: "old schema", values: [1, 2, 3]), forKey: "page")
+
+        let reader = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            inlineStorageThreshold: .max,
+            cacheRootURL: root
+        )
+        XCTAssertTrue(reader.containsKey("page"))
+        XCTAssertNil(reader.value(forKey: "page"))
+        XCTAssertFalse(reader.containsKey("page"))
+    }
+
+    func testUndecodableExternalValueAndFileAreEvictedOnRead() throws {
+        let root = try temporaryRoot()
+        let namespace = "decode-external-\(UUID().uuidString)"
+
+        let writer = PersistedLRUCache<String, Record>(
+            namespace: namespace,
+            inlineStorageThreshold: 1,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        writer.setValue(Record(title: "old schema", values: [1, 2, 3]), forKey: "page")
+        let externalURL = try XCTUnwrap(writer.debugDiskEntryURL(for: "page"))
+
+        let reader = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            inlineStorageThreshold: 1,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        XCTAssertTrue(reader.containsKey("page"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: externalURL.path))
+        XCTAssertNil(reader.value(forKey: "page"))
+        XCTAssertFalse(reader.containsKey("page"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: externalURL.path))
+    }
+
     func testSmallValuesPersistInlineAndLargeValuesPersistAsFiles() throws {
         let root = try temporaryRoot()
         let namespace = "mixed-\(UUID().uuidString)"

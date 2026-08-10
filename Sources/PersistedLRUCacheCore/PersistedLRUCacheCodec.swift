@@ -48,25 +48,31 @@ package enum PersistedLRUCacheCodec {
         from payload: PersistedLRUCachePayload,
         decoder: JSONDecoder = JSONDecoder()
     ) throws -> Value? {
-        guard let data = payload.data else {
+        let encoding = normalizedEncoding(payload.encoding)
+        if encoding == "nil" {
+            guard payload.data == nil else {
+                throw PersistedLRUCacheCodecError.unexpectedDataForNil
+            }
             return nil
         }
 
-        switch normalizedEncoding(payload.encoding) {
+        guard let data = payload.data else {
+            throw PersistedLRUCacheCodecError.missingData(encoding: encoding)
+        }
+
+        switch encoding {
         case "raw":
-            return decodeRaw(type, data: data)
+            return try decodeRaw(type, data: data)
         case "lz4":
             let decompressed = try (data as NSData).decompressed(using: .lz4) as Data
-            return decodeRaw(type, data: decompressed)
+            return try decodeRaw(type, data: decompressed)
         case "json":
             return try decoder.decode(type, from: data)
         case "json.lz4":
             let decompressed = try (data as NSData).decompressed(using: .lz4) as Data
             return try decoder.decode(type, from: decompressed)
-        case "nil":
-            return nil
         default:
-            return nil
+            throw PersistedLRUCacheCodecError.unsupportedEncoding(encoding)
         }
     }
 
@@ -82,20 +88,29 @@ package enum PersistedLRUCacheCodec {
         return PersistedLRUCachePayload(data: rawData, encoding: "raw")
     }
 
-    private static func decodeRaw<Value: Codable>(_ type: Value.Type, data: Data) -> Value? {
+    private static func decodeRaw<Value: Codable>(_ type: Value.Type, data: Data) throws -> Value {
         if type == String.self {
-            return String(data: data, encoding: .utf8) as? Value
+            guard let value = String(data: data, encoding: .utf8) as? Value else {
+                throw PersistedLRUCacheCodecError.invalidRawValue
+            }
+            return value
         }
 
         if type == [UInt8].self {
-            return [UInt8](data) as? Value
+            guard let value = [UInt8](data) as? Value else {
+                throw PersistedLRUCacheCodecError.invalidRawValue
+            }
+            return value
         }
 
         if type == Data.self {
-            return data as? Value
+            guard let value = data as? Value else {
+                throw PersistedLRUCacheCodecError.invalidRawValue
+            }
+            return value
         }
 
-        return nil
+        throw PersistedLRUCacheCodecError.unsupportedRawType
     }
 
     private static func normalizedEncoding(_ encoding: String) -> String {
@@ -106,4 +121,12 @@ package enum PersistedLRUCacheCodec {
             return encoding
         }
     }
+}
+
+package enum PersistedLRUCacheCodecError: Error, Equatable, Sendable {
+    case missingData(encoding: String)
+    case unexpectedDataForNil
+    case unsupportedEncoding(String)
+    case unsupportedRawType
+    case invalidRawValue
 }

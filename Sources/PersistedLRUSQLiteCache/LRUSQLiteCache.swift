@@ -579,7 +579,13 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
             return nil
         }
 
-        let decoded = try? PersistedLRUCacheCodec.decode(O.self, from: payload(from: entry))
+        let decoded: O?
+        do {
+            decoded = try PersistedLRUCacheCodec.decode(O.self, from: payload(from: entry))
+        } catch {
+            removeValue(forKey: key)
+            return nil
+        }
         if let decoded {
             setMemoryValue(decoded, forKeyHash: keyHash, cost: entry.cost)
         }
@@ -587,7 +593,7 @@ open class LRUSQLiteCache<I: Encodable, O: Codable>: ObservableObject {
         if tracksPersistentAccess {
             recordPersistentAccess(forKeyHash: keyHash)
         }
-        return decoded ?? nil
+        return decoded
     }
 
     public func setValue(_ value: O?, forKey key: I) {

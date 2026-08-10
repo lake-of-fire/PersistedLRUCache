@@ -696,7 +696,13 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
             return nil
         }
 
-        let decoded = try? PersistedLRUCacheCodec.decode(O.self, from: payload)
+        let decoded: O?
+        do {
+            decoded = try PersistedLRUCacheCodec.decode(O.self, from: payload)
+        } catch {
+            removeValue(forKey: key)
+            return nil
+        }
         if let decoded, payload.cost <= memoryThreshold {
             setMemoryValue(decoded, forKeyHash: keyHash, cost: payload.cost)
         }
@@ -704,7 +710,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         if tracksPersistentAccess {
             recordPersistentAccess(forKeyHash: keyHash)
         }
-        return decoded ?? nil
+        return decoded
     }
 
     public func setValue(_ value: O?, forKey key: I) {
