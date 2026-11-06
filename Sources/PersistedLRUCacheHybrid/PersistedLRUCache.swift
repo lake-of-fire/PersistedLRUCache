@@ -318,13 +318,19 @@ private struct HybridSQLiteLRUStore {
         let ids = orderedUnique(entries.map(\.id))
         let existing = try existingEntries(forIDs: ids, in: db)
         let oldFileNames = existing.values.compactMap(\.fileName)
-        let newFileNames = Set(entries.compactMap(\.fileName))
-        let obsoleteFileNames = oldFileNames.filter { !newFileNames.contains($0) }
         var finalCostByID = [String: Int]()
+        var finalFileNameByID = [String: String]()
         finalCostByID.reserveCapacity(ids.count)
+        finalFileNameByID.reserveCapacity(ids.count)
         for entry in entries {
             finalCostByID[entry.id] = entry.cost
+            finalFileNameByID[entry.id] = entry.fileName
         }
+        let retainedFileNames = Set(finalFileNameByID.values)
+        // Repeated keys retain only their final row; earlier batch files are
+        // obsolete even when they never became a committed file pointer.
+        let obsoleteFileNames = orderedUnique(oldFileNames + entries.compactMap(\.fileName))
+            .filter { !retainedFileNames.contains($0) }
         var itemCountDelta = 0
         var totalCostDelta = 0
         for (id, cost) in finalCostByID {
@@ -882,16 +888,20 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
         newExternalFileNamesOnFailure: [String]
     ) -> [String] {
         guard !entries.isEmpty else { return [] }
+        guard let store else {
+            removeExternalFiles(fileNames: newExternalFileNamesOnFailure)
+            return []
+        }
 
         do {
             let result: HybridCacheMutationResult
             if tracksPersistentAccess {
-                result = try store?.upsert(
+                result = try store.upsert(
                     entries,
                     pendingAccesses: takePendingAccesses()
-                ) ?? HybridCacheMutationResult()
+                )
             } else {
-                result = try store?.upsert(entries) ?? HybridCacheMutationResult()
+                result = try store.upsert(entries)
             }
             applyPersistentStatsDelta(result)
             removeExternalFiles(fileNames: result.obsoleteFileNames)
@@ -1079,7 +1089,7 @@ open class PersistedLRUCache<I: Encodable, O: Codable>: ObservableObject {
     }
 
     private func externalFileName(forKeyHash keyHash: String, encoding: String) -> String {
-        keyHash + "." + fileExtension(forEncoding: encoding)
+        keyHash + "-" + UUID().uuidString + "." + fileExtension(forEncoding: encoding)
     }
 
     private func externalFileURL(forFileName fileName: String) -> URL {

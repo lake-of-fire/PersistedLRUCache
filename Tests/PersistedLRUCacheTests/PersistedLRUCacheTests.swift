@@ -268,11 +268,179 @@ final class PersistedLRUCacheTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: externalURL.path))
     }
 
+    func testQueuedExternalReplacementPreservesCommittedBytesUntilFlush() throws {
+        let root = try temporaryRoot()
+        let namespace = "async-committed-replacement-\(UUID().uuidString)"
+        let first = String(repeating: "a", count: 32)
+        let second = String(repeating: "b", count: 32)
+        let committed = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        committed.setValue(first, forKey: "key")
+        let originalURL = try XCTUnwrap(committed.debugDiskEntryURL(for: "key"))
+        let writer = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            writeMode: .asynchronous(batchDelay: 60),
+            cacheRootURL: root
+        )
+
+        writer.setValue(second, forKey: "key")
+        let beforeFlush = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        XCTAssertEqual(beforeFlush.value(forKey: "key"), first)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
+
+        writer.flushPendingWrites()
+        let afterFlush = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        XCTAssertEqual(afterFlush.value(forKey: "key"), second)
+        let replacementURL = try XCTUnwrap(afterFlush.debugDiskEntryURL(for: "key"))
+        XCTAssertNotEqual(replacementURL, originalURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: replacementURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: originalURL.path))
+        XCTAssertEqual(try externalFileNames(root: root, namespace: namespace), [replacementURL.lastPathComponent])
+    }
+
+    func testQueuedExternalReplacementsRetainTheFinalPayloadFile() throws {
+        let root = try temporaryRoot()
+        let namespace = "async-external-replacements-\(UUID().uuidString)"
+        let finalValue = String(repeating: "b", count: 32)
+        let writer = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            writeMode: .asynchronous(batchDelay: 60),
+            cacheRootURL: root
+        )
+
+        writer.setValue(String(repeating: "a", count: 32), forKey: "key")
+        writer.setValue(finalValue, forKey: "key")
+        writer.flushPendingWrites()
+
+        let reloaded = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        let finalURL = try XCTUnwrap(reloaded.debugDiskEntryURL(for: "key"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
+        XCTAssertEqual(reloaded.value(forKey: "key"), finalValue)
+        XCTAssertEqual(try externalFileNames(root: root, namespace: namespace), [finalURL.lastPathComponent])
+    }
+
+    func testDuplicateBatchEndingInlineRemovesIntermediateExternalFiles() throws {
+        let root = try temporaryRoot()
+        let namespace = "batch-duplicate-inline-\(UUID().uuidString)"
+        let cache = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+
+        cache.setValues([
+            ("key", String(repeating: "a", count: 32)),
+            ("key", "small"),
+        ])
+
+        let reloaded = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        XCTAssertEqual(reloaded.value(forKey: "key"), "small")
+        XCTAssertNil(reloaded.debugDiskEntryURL(for: "key"))
+        XCTAssertEqual(try externalFileNames(root: root, namespace: namespace), [])
+    }
+
+    func testDuplicateBatchEndingExternalRetainsOnlyTheFinalPayloadFile() throws {
+        let root = try temporaryRoot()
+        let namespace = "batch-duplicate-external-\(UUID().uuidString)"
+        let finalValue = String(repeating: "b", count: 32)
+        let cache = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+
+        cache.setValues([
+            ("key", String(repeating: "a", count: 32)),
+            ("key", finalValue),
+        ])
+
+        let reloaded = PersistedLRUCache<String, String>(
+            namespace: namespace,
+            memoryThreshold: 0,
+            inlineStorageThreshold: 8,
+            compressionThreshold: .max,
+            cacheRootURL: root
+        )
+        let finalURL = try XCTUnwrap(reloaded.debugDiskEntryURL(for: "key"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: finalURL.path))
+        XCTAssertEqual(reloaded.value(forKey: "key"), finalValue)
+        XCTAssertEqual(try externalFileNames(root: root, namespace: namespace), [finalURL.lastPathComponent])
+    }
+
+    func testUnavailableStoreCleansNewExternalFilesAndPreservesMemoryFallback() throws {
+        let root = try temporaryRoot()
+        for writeMode in [PersistedLRUCacheWriteMode.immediate, .asynchronous(batchDelay: 60)] {
+            let namespace = "unavailable-store-\(UUID().uuidString)"
+            let databaseURL = root.appendingPathComponent("PersistedLRUCache")
+                .appendingPathComponent(namespace).appendingPathComponent("cache.sqlite")
+            try FileManager.default.createDirectory(at: databaseURL, withIntermediateDirectories: true)
+            let cache = PersistedLRUCache<String, String>(
+                namespace: namespace,
+                memoryThreshold: 1_024,
+                inlineStorageThreshold: 8,
+                compressionThreshold: .max,
+                writeMode: writeMode,
+                cacheRootURL: root
+            )
+            let finalValue = String(repeating: "b", count: 32)
+
+            cache.setValue(String(repeating: "a", count: 32), forKey: "key")
+            cache.setValue(finalValue, forKey: "key")
+            cache.flushPendingWrites()
+
+            XCTAssertEqual(cache.value(forKey: "key"), finalValue)
+            XCTAssertNil(cache.debugDiskEntryURL(for: "key"))
+            XCTAssertEqual(try externalFileNames(root: root, namespace: namespace), [])
+        }
+    }
+
     private func temporaryRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PersistedLRUCacheTests")
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: root)
+        }
         return root
     }
 
