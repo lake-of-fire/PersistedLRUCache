@@ -63,7 +63,7 @@ let package = Package(
         ),
         .testTarget(
             name: "PersistedLRUCacheTests",
-            dependencies: ["PersistedLRUCacheHybrid"]
+            dependencies: ["PersistedLRUCacheHybrid", .product(name: "GRDB", package: "GRDB.swift")]
         ),
         .testTarget(
             name: "PersistedLRUSQLiteCacheTests",
