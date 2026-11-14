@@ -62,34 +62,59 @@ private struct SQLiteLRUStore {
 
         var configuration = Configuration()
         configuration.maximumReaderCount = 8
+        configuration.observesSuspensionNotifications = true
         configuration.prepareDatabase { db in
             try db.execute(sql: "PRAGMA journal_mode=WAL")
             try db.execute(sql: "PRAGMA synchronous=NORMAL")
             try db.execute(sql: "PRAGMA foreign_keys=OFF")
         }
 
-        pool = try DatabasePool(path: fileURL.path, configuration: configuration)
-        try pool.write { db in
+        pool = try CacheStorageExecutionProtection.withExecution { checkpoint in
+            try checkpoint()
+            return try DatabasePool(path: fileURL.path, configuration: configuration)
+        }
+        try write { db in
             try Self.ensureSchema(db)
         }
     }
 
+    private func read<T>(_ operation: (Database) throws -> T) throws -> T {
+        try CacheStorageExecutionProtection.withExecution { checkpoint in
+            try pool.read { db in
+                try checkpoint()
+                return try operation(db)
+            }
+        }
+    }
+
+    private func write<T>(_ operation: (Database) throws -> T) throws -> T {
+        try CacheStorageExecutionProtection.withExecution { checkpoint in
+            try pool.write { db in
+                try checkpoint()
+                let value = try operation(db)
+                // Throw inside GRDB's transaction so expiration rolls it back.
+                try checkpoint()
+                return value
+            }
+        }
+    }
+
     func fetch(id: String) throws -> SQLiteCacheValue? {
-        try pool.read { db in
+        try read { db in
             let statement = try db.cachedStatement(sql: Self.fetchSQL)
             return try Row.fetchOne(statement, arguments: [id]).map(SQLiteCacheValue.init(row:))
         }
     }
 
     func exists(id: String) -> Bool {
-        (try? pool.read { db in
+        (try? read { db in
             let statement = try db.cachedStatement(sql: Self.existsSQL)
             return try Int.fetchOne(statement, arguments: [id]) != nil
         }) ?? false
     }
 
     func upsert(_ entry: SQLiteCacheEntry) throws -> SQLiteCacheMutationResult {
-        try pool.write { db in
+        try write { db in
             try Self.upsert([entry], in: db)
         }
     }
@@ -97,13 +122,13 @@ private struct SQLiteLRUStore {
     func upsert(_ entries: [SQLiteCacheEntry]) throws -> SQLiteCacheMutationResult {
         guard !entries.isEmpty else { return SQLiteCacheMutationResult() }
 
-        return try pool.write { db in
+        return try write { db in
             try Self.upsert(entries, in: db)
         }
     }
 
     func upsert(_ entry: SQLiteCacheEntry, pendingAccesses: [String: Int64]) throws -> SQLiteCacheMutationResult {
-        try pool.write { db in
+        try write { db in
             try Self.updateLastAccesses(pendingAccesses, in: db)
             return try Self.upsert([entry], in: db)
         }
@@ -112,7 +137,7 @@ private struct SQLiteLRUStore {
     func upsert(_ entries: [SQLiteCacheEntry], pendingAccesses: [String: Int64]) throws -> SQLiteCacheMutationResult {
         guard !entries.isEmpty else { return SQLiteCacheMutationResult() }
 
-        return try pool.write { db in
+        return try write { db in
             try Self.updateLastAccesses(pendingAccesses, in: db)
             return try Self.upsert(entries, in: db)
         }
@@ -124,7 +149,7 @@ private struct SQLiteLRUStore {
         countLimit: Int,
         totalBytesLimit: Int
     ) throws -> [String] {
-        try pool.write { db in
+        try write { db in
             try Self.updateLastAccesses(pendingAccesses, in: db)
             _ = try Self.upsert([entry], in: db)
             return try Self.trim(countLimit: countLimit, totalBytesLimit: totalBytesLimit, in: db)
@@ -139,7 +164,7 @@ private struct SQLiteLRUStore {
     ) throws -> [String] {
         guard !entries.isEmpty else { return [] }
 
-        return try pool.write { db in
+        return try write { db in
             try Self.updateLastAccesses(pendingAccesses, in: db)
             _ = try Self.upsert(entries, in: db)
             return try Self.trim(countLimit: countLimit, totalBytesLimit: totalBytesLimit, in: db)
@@ -148,13 +173,13 @@ private struct SQLiteLRUStore {
 
     func updateLastAccesses(_ accesses: [String: Int64]) throws {
         guard !accesses.isEmpty else { return }
-        try pool.write { db in
+        try write { db in
             try Self.updateLastAccesses(accesses, in: db)
         }
     }
 
     func removeByID(_ id: String) throws -> SQLiteCacheMutationResult {
-        try pool.write { db in
+        try write { db in
             let existing = try Self.existingCosts(forIDs: [id], in: db)
             try Self.removeByID(id, in: db)
             let oldCost = existing[id] ?? 0
@@ -166,25 +191,25 @@ private struct SQLiteLRUStore {
     }
 
     func removeAll() throws {
-        try pool.write { db in
+        try write { db in
             try db.execute(sql: "DELETE FROM cache")
         }
     }
 
     func maximumLastAccess() -> Int64 {
-        (try? pool.read { db in
+        (try? read { db in
             try Int64.fetchOne(db, sql: "SELECT COALESCE(MAX(last_access), 0) FROM cache") ?? 0
         }) ?? 0
     }
 
     func trim(countLimit: Int, totalBytesLimit: Int) throws -> [String] {
-        try pool.write { db in
+        try write { db in
             try Self.trim(countLimit: countLimit, totalBytesLimit: totalBytesLimit, in: db)
         }
     }
 
     func cacheStats() throws -> SQLiteCacheStats {
-        try pool.read { db in
+        try read { db in
             try Self.cacheStats(in: db)
         }
     }
